@@ -10,27 +10,14 @@ import streamlit as st
 from dotenv import load_dotenv
 import pymupdf as fitz
 from PIL import Image
-from openai import OpenAI  # Native lightweight client for fast streaming and vision calls
-
-from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, ChatNVIDIA
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-
-# Compatibility import for LangChain chains
-try:
-    from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-    from langchain_classic.chains import create_retrieval_chain
-except ModuleNotFoundError:
-    from langchain.chains.combine_documents import create_stuff_documents_chain
-    from langchain.chains import create_retrieval_chain
+from openai import OpenAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
 # 1. Environment & API Key Setup
 load_dotenv()
 
-api_key = os.getenv("NVIDIA_API_KEY") or os.getenv("api") or os.getenv("API_KEY") or ""
-os.environ["NVIDIA_API_KEY"] = api_key
+api_key = os.getenv("api") or os.getenv("api") or os.getenv("api") or ""
+os.environ["api"] = api_key
 
 BASE_URL = "https://integrate.api.nvidia.com/v1"
 MODEL_NAME = "deepseek-ai/deepseek-v4.1-flash"
@@ -43,7 +30,7 @@ st.title("NVIDIA NIM Multimodal & Chat Suite")
 mode = st.sidebar.radio(
     "Select Operating Mode:", 
     [
-        "Text RAG (FAISS Document Search)", 
+        "Direct Text RAG (DeepSeek Context)", 
         "Direct Visual Analysis (PNG, JPG, PDF)", 
         "General LLM Chat (With Memory)"
     ]
@@ -60,7 +47,7 @@ def process_and_compress_image(image_bytes, max_size=(1024, 1024)):
     img.save(buffer, format="JPEG", quality=85)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-# Initialize LangChain model for RAG
+# Initialize LangChain LLM model for Direct Context Analysis
 deepseek_llm = ChatNVIDIA(
     base_url=BASE_URL,
     model=MODEL_NAME,
@@ -76,87 +63,64 @@ native_client = OpenAI(
 )
 
 # =====================================================================
-# MODE 1: TEXT RAG SEARCH
+# MODE 1: DIRECT TEXT RAG (DEEPSEEK DIRECT CONTEXT)
 # =====================================================================
-if mode == "Text RAG (FAISS Document Search)":
-    st.subheader("Text-Based RAG Search over Uploaded Documents")
+if mode == "Direct Text RAG (DeepSeek Context)":
+    st.subheader("Direct Context Document Analysis with DeepSeek Flash")
 
-    os.makedirs("./us_census", exist_ok=True)
-    rag_files = st.file_uploader(
-        "Upload PDF documents for RAG indexing:", 
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents for analysis:", 
         type=["pdf"], 
         accept_multiple_files=True
     )
 
-    if rag_files:
-        for file in rag_files:
-            file_path = os.path.join("./us_census", file.name)
-            with open(file_path, "wb") as f:
-                f.write(file.getbuffer())
-        st.success(f"Saved {len(rag_files)} file(s) to `./us_census`.")
-
-    def vector_embeddings():
-        with st.spinner("Ingesting documents from ./us_census..."):
-            st.session_state.embeddings = NVIDIAEmbeddings(
-                base_url=BASE_URL,
-                model="deepseek-ai/deepseek-v4.1-flash",
-                nvidia_api_key=api_key
-            )
-            st.session_state.loader = PyPDFDirectoryLoader("./us_census")
-            st.session_state.docs = st.session_state.loader.load()
+    if uploaded_files:
+        if "extracted_text" not in st.session_state or st.sidebar.button("Re-process Documents"):
+            combined_text = ""
+            file_names = []
             
-            if not st.session_state.docs:
-                st.error("No valid PDF documents found in `./us_census`. Please upload a PDF first.")
-                return
+            with st.spinner("Extracting text from uploaded PDF(s)..."):
+                for uploaded_file in uploaded_files:
+                    file_names.append(uploaded_file.name)
+                    pdf_doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                    for page in pdf_doc:
+                        combined_text += page.get_text() + "\n"
+            
+            st.session_state.extracted_text = combined_text
+            st.session_state.file_names = file_names
+            st.success(f"Successfully processed {len(file_names)} file(s) ({len(combined_text)} characters extracted).")
 
-            st.session_state.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-            st.session_state.final_document = st.session_state.text_splitter.split_documents(st.session_state.docs)
+    if "extracted_text" in st.session_state and st.session_state.extracted_text:
+        with st.expander("Preview Extracted Document Text"):
+            st.text_area("Document Content Overview", st.session_state.extracted_text[:3000] + "...", height=200)
 
-            st.session_state.vectors = FAISS.from_documents(st.session_state.final_document, st.session_state.embeddings)
-            st.success(f"Vector store ready! Loaded {len(st.session_state.final_document)} chunks.")
+        user_question = st.text_input("Ask a question about the document(s):")
 
-    prompt = ChatPromptTemplate.from_template(
-    """
-    Answer the question based on the provided context only.
-    Please provide the most accurate response based on the question.
-
-    <context>
-    {context}
-    </context>
-
-    Question: {input}
-    """
-    )
-
-    if st.button("Ingest Document Embeddings"):
-        vector_embeddings()
-
-    user_question = st.text_input("Enter Your Question From Documents:")
-
-    if user_question:
-        if "vectors" not in st.session_state:
-            st.error("Please click 'Ingest Document Embeddings' button first to build the vector store!")
-        else:
-            try:
-                document_chain = create_stuff_documents_chain(deepseek_llm, prompt)
-                retriever = st.session_state.vectors.as_retriever(search_kwargs={"k": 4})
-                retrieval_chain = create_retrieval_chain(retriever, document_chain)
-
+        if user_question:
+            with st.spinner("DeepSeek Flash is reading document context and generating response..."):
                 start_time = time.process_time()
-                response = retrieval_chain.invoke({'input': user_question})
-                elapsed_time = time.process_time() - start_time
+                
+                # Direct context injection into prompt
+                prompt_text = f"""
+                You are an expert document analysis assistant. Answer the user's question based strictly on the provided context below.
+                
+                <context>
+                {st.session_state.extracted_text[:120000]}
+                </context>
+                
+                Question: {user_question}
+                """
+                
+                try:
+                    response = deepseek_llm.invoke(prompt_text)
+                    elapsed_time = time.process_time() - start_time
 
-                st.write(f"**Response from DeepSeek Flash (retrieved in {elapsed_time:.2f}s):**")
-                st.write(response["answer"])
-
-                with st.expander("Document Similarity Search (Retrieved Chunks)"):
-                    for i, doc in enumerate(response["context"]):
-                        st.markdown(f"**Chunk {i+1}:**")
-                        st.write(doc.page_content)
-                        st.caption(f"Source: {doc.metadata.get('source', 'Unknown')}")
-                        st.divider()
-            except Exception as e:
-                st.error(f"API request failed: {str(e)}")
+                    st.write(f"**Response from DeepSeek Flash (processed in {elapsed_time:.2f}s):**")
+                    st.write(response.content)
+                except Exception as e:
+                    st.error(f"Analysis failed: {str(e)}")
+    else:
+        st.info("Please upload one or more PDF documents above to begin querying.")
 
 # =====================================================================
 # MODE 2: DIRECT VISUAL ANALYSIS (OPTIMIZED NATIVE STREAMING)
